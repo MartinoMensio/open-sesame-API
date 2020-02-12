@@ -711,7 +711,7 @@ def run_pipeline(pipeline, text_input):
 
     text_input = clean_unidecode(text_input)
 
-    text_lines = text_input.splitlines()
+    text_lines = text_input.splitlines(True) # keepends so that people can keep counting
     offsets = run_model_targetid(text_lines, model_targetid_variables)
     predictions, sents_num = run_model_frameid(options_frameid, model_frameid_variables)
 
@@ -744,7 +744,10 @@ def run_pipeline(pipeline, text_input):
 
 def clean_unidecode(content):
 
-    content = content.decode('utf-8')
+    try:
+        content = content.decode('utf-8')
+    except:
+        pass
     content = unidecode.unidecode(content)
     
     return content
