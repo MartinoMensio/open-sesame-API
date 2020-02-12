@@ -3,6 +3,7 @@ import json
 import os
 import sys
 import time
+import unidecode
 from optparse import OptionParser
 
 from dynet import *
@@ -379,20 +380,21 @@ def build_targetid_model(model_name, common):
 
     return model, model_variables
 
-def run_model_targetid(raw_input_path, model_variables):
+def run_model_targetid(text_lines, model_variables):
+    """`text_input` is the document, which contains lines"""
 
     builders = model_variables['builders']
     model_dir = model_variables['model_dir']
 
-    with open(raw_input_path, "r") as fin:
-        instances = []
-        offsets = [] # contains array with for each row, the offsets of each token
-        for i,line in enumerate(fin):
-            instance, offset = make_data_instance(line, i, get_offsets=True)
-            instances.append(instance)
-            offsets.append(offset)
-        # filter empty rows
-        instances = [el for el in instances if el]
+    
+    instances = []
+    offsets = [] # contains array with for each row, the offsets of each token
+    for i,line in enumerate(text_lines):
+        instance, offset = make_data_instance(line, i, get_offsets=True)
+        instances.append(instance)
+        offsets.append(offset)
+    # filter empty rows
+    instances = [el for el in instances if el]
 
     with open('{}offsets.json'.format(model_dir), 'w') as f:
         json.dump(offsets, f)
@@ -677,17 +679,11 @@ def run_model_frameid(options, model_variables):
     return predictions, sents_num
 
 
-if __name__ == '__main__':
 
-    optpr = OptionParser()
-    optpr.add_option("-n", "--model_name", help="Name of model directory to save model to.")
-    optpr.add_option("--raw_input", type="str", metavar="FILE")
-    (options, args) = optpr.parse_args()
-
+def get_pipeline():
     common = common_load()
 
     model_name_targetid = 'fn1.7-pretrained-targetid'
-    raw_input = options.raw_input
     options_frameid = {
         'model_name': 'fn1.7-pretrained-frameid',
         'raw_input': 'logs/fn1.7-pretrained-targetid/predicted-targets.conll',
@@ -697,14 +693,32 @@ if __name__ == '__main__':
 
     model_targetid, model_targetid_variables = build_targetid_model(model_name_targetid, common)
     model_frameid, model_frameid_variables = build_frameid_model(options_frameid, common)
-    
-    offsets = run_model_targetid(raw_input, model_targetid_variables)
+
+    return {
+        'model_targetid': model_targetid,
+        'model_targetid_variables': model_targetid_variables,
+        'model_frameid': model_frameid,
+        'model_frameid_variables': model_frameid_variables,
+        'options_frameid': options_frameid
+    }
+
+def run_pipeline(pipeline, text_input):
+    model_targetid = pipeline['model_targetid']
+    model_targetid_variables = pipeline['model_targetid_variables']
+    model_frameid = pipeline['model_frameid']
+    model_frameid_variables = pipeline['model_frameid_variables']
+    options_frameid = pipeline['options_frameid']
+
+    text_input = clean_unidecode(text_input)
+
+    text_lines = text_input.splitlines()
+    offsets = run_model_targetid(text_lines, model_targetid_variables)
     predictions, sents_num = run_model_frameid(options_frameid, model_frameid_variables)
 
     # [{index: (LexicalUnit, Frame)} for each instance]
     # LexicalUnit.get_str(LUDICT, LUPOSDICT), Frame.get_str(FRAMEDICT)
     #print(predictions)
-    result = []
+    predictions_annot = []
     for prediction, sent_num in zip(predictions, sents_num):
         for token_id, (lu, frame) in prediction.items():
             offset_line = offsets[sent_num]
@@ -717,7 +731,36 @@ if __name__ == '__main__':
                     'end': offset_line[token_id][1]
                 }
             }
-            result.append(lu)
+            predictions_annot.append(lu)
 
-    with open('predictions.json', 'w') as f:
+
+    result = {
+        'text_lines': text_lines,
+        'predictions': predictions_annot
+    }
+    with open('result.json', 'w') as f:
         json.dump(result, f)
+    return result
+
+def clean_unidecode(content):
+
+    content = content.decode('utf-8')
+    content = unidecode.unidecode(content)
+    
+    return content
+
+
+if __name__ == '__main__':
+    optpr = OptionParser()
+    optpr.add_option("--raw_input", type="str", metavar="FILE")
+    (options, args) = optpr.parse_args()
+
+    pipeline = get_pipeline()
+
+
+    with open(options.raw_input) as f:
+        text = f.read()
+
+    result = run_pipeline(pipeline, text)
+    
+
