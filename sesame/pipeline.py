@@ -211,17 +211,11 @@ def build_model(options):
 
     train_conll = TRAIN_FTE
 
-    USE_DROPOUT = True
-    if options.mode in ["test", "predict"]:
-        USE_DROPOUT = False
+    USE_DROPOUT = False
 
     sys.stderr.write("_____________________\n")
     sys.stderr.write("COMMAND: {}\n".format(" ".join(sys.argv)))
-    if options.mode in ["train", "refresh"]:
-        sys.stderr.write("VALIDATED MODEL SAVED TO:\t{}\n".format(model_file_name))
-    else:
-        sys.stderr.write("MODEL FOR TEST / PREDICTION:\t{}\n".format(model_file_name))
-    sys.stderr.write("PARSING MODE:\t{}\n".format(options.mode))
+    sys.stderr.write("MODEL FOR TEST / PREDICTION:\t{}\n".format(model_file_name))
     sys.stderr.write("_____________________\n\n")
 
 
@@ -240,18 +234,6 @@ def build_model(options):
     lock_dicts()
     UNKTOKEN = VOCDICT.getid(UNK)
 
-    if options.mode in ["train", "refresh"]:
-        dev_examples, _, _ = read_conll(DEV_CONLL)
-        combined_dev = combine_examples(dev_examples)
-        out_conll_file = "{}predicted-{}-targetid-dev.conll".format(model_dir, VERSION)
-    elif options.mode  == "test":
-        dev_examples, m, t = read_conll(TEST_CONLL)
-        combined_dev = combine_examples(dev_examples)
-        out_conll_file = "{}predicted-{}-targetid-test.conll".format(model_dir, VERSION)
-    elif options.mode == "predict":
-        pass
-    else:
-        raise Exception("Invalid parser mode", options.mode)
 
     # Default configurations.
     configuration = {"train": train_conll,
@@ -271,16 +253,8 @@ def build_model(options):
                     "eval_after_every_epochs": 100,
                     "dev_eval_epoch_frequency": 3}
     configuration_file = os.path.join(model_dir, "configuration.json")
-    if options.mode == "train":
-        if options.config:
-            config_json = open(options.config, "r")
-            configuration = json.load(config_json)
-        with open(configuration_file, "w") as fout:
-            fout.write(json.dumps(configuration))
-            fout.close()
-    else:
-        json_file = open(configuration_file, "r")
-        configuration = json.load(json_file)
+    json_file = open(configuration_file, "r")
+    configuration = json.load(json_file)
 
     UNK_PROB = configuration["unk_prob"]
     DROPOUT_RATE = configuration["dropout_rate"]
@@ -372,114 +346,8 @@ def build_model(options):
     }
 
 
-
-    best_dev_f1 = 0.0
-    if options.mode in ["refresh"]:
-        sys.stderr.write("Reloading model from {} ...\n".format(model_file_name))
-        model.populate(model_file_name)
-        with open(os.path.join(model_dir, "best-dev-f1.txt"), "r") as fin:
-            for line in fin:
-                best_dev_f1 = float(line.strip())
-        fin.close()
-        sys.stderr.write("Best dev F1 so far = %.4f\n" % best_dev_f1)
-
-
-    if options.mode in ["train", "refresh"]:
-        loss = 0.0
-        train_result = [0.0, 0.0, 0.0]
-
-        last_updated_epoch = 0
-
-        for epoch in xrange(NUM_EPOCHS):
-            random.shuffle(combined_train)
-            for idx, trex in enumerate(combined_train, 1):
-                if idx % EVAL_EVERY_EPOCH == 0:
-                    trainer.status()
-                    _, _, trainf = calc_f(train_result)
-                    sys.stderr.write("epoch = %d.%d loss = %.6f train f1 = %.4f\n" %(epoch, idx, loss/idx, trainf))
-                    train_result = [0.0, 0.0, 0.0]
-                inptoks = []
-                unk_replace_tokens(trex.tokens, inptoks, VOCDICT, UNK_PROB, UNKTOKEN)
-
-                trex_loss, trexpred = identify_targets(
-                    builders, inptoks, trex.postags, trex.lemmas, model_variables, gold_targets=trex.targetframedict.keys())
-                trainex_result = evaluate_example_targetid(trex.targetframedict.keys(), trexpred)
-                train_result = np.add(train_result, trainex_result)
-
-                if trex_loss is not None:
-                    loss += trex_loss.scalar_value()
-                    trex_loss.backward()
-                    trainer.update()
-
-                if idx % DEV_EVAL_EPOCH == 0:
-                    corpus_result = [0.0, 0.0, 0.0]
-                    devtagged = devloss = 0.0
-                    predictions = []
-                    for devex in combined_dev:
-                        devludict = devex.get_only_targets()
-                        dl, predicted = identify_targets(
-                            builders, devex.tokens, devex.postags, devex.lemmas, model_variables)
-                        if dl is not None:
-                            devloss += dl.scalar_value()
-                        predictions.append(predicted)
-
-                        devex_result = evaluate_example_targetid(devex.targetframedict.keys(), predicted)
-                        corpus_result = np.add(corpus_result, devex_result)
-                        devtagged += 1
-
-                    dev_p, dev_r, dev_f1 = calc_f(corpus_result)
-                    dev_tp, dev_fp, dev_fn = corpus_result
-                    sys.stderr.write("[dev epoch=%d] loss = %.6f "
-                                    "p = %.4f (%.1f/%.1f) r = %.4f (%.1f/%.1f) f1 = %.4f"
-                                    % (epoch, devloss/devtagged,
-                                        dev_p, dev_tp, dev_tp + dev_fp,
-                                        dev_r, dev_tp, dev_tp + dev_fn,
-                                        dev_f1))
-                    if dev_f1 > best_dev_f1:
-                        best_dev_f1 = dev_f1
-                        with open(os.path.join(model_dir, "best-dev-f1.txt"), "w") as fout:
-                            fout.write("{}\n".format(best_dev_f1))
-
-                        sys.stderr.write(" -- saving to {}".format(model_file_name))
-                        model.save(model_file_name)
-                        print_as_conll(combined_dev, predictions, out_conll_file)
-
-                        last_updated_epoch = epoch
-                    sys.stderr.write("\n")
-            if epoch - last_updated_epoch > PATIENCE:
-                sys.stderr.write("Ran out of patience, ending training.\n")
-                break
-            loss = 0.0
-
-    elif options.mode == "test":
-        sys.stderr.write("Reading model from {} ...\n".format(model_file_name))
-        model.populate(model_file_name)
-        corpus_tp_fp_fn = [0.0, 0.0, 0.0]
-
-        test_predictions = []
-
-        for test_ex in combined_dev:
-            _, predicted = identify_targets(builders, test_ex.tokens, test_ex.postags, test_ex.lemmas, model_variables)
-
-            tp_fp_fn = evaluate_example_targetid(test_ex.targetframedict.keys(), predicted)
-            corpus_tp_fp_fn = np.add(corpus_tp_fp_fn, tp_fp_fn)
-
-            test_predictions.append(predicted)
-
-        test_tp, test_fp, test_fn = corpus_tp_fp_fn
-        test_prec, test_rec, test_f1 = calc_f(corpus_tp_fp_fn)
-        sys.stderr.write("[test] p = %.4f (%.1f/%.1f) r = %.4f (%.1f/%.1f) f1 = %.4f\n" %(
-            test_prec, test_tp, test_tp + test_fp,
-            test_rec, test_tp, test_tp + test_fn,
-            test_f1))
-
-        sys.stderr.write("Printing output in CoNLL format to {}\n".format(out_conll_file))
-        print_as_conll(combined_dev, test_predictions, out_conll_file)
-        sys.stderr.write("Done!\n")
-
-    elif options.mode == "predict":
-        sys.stderr.write("Reading model from {} ...\n".format(model_file_name))
-        model.populate(model_file_name)
+    sys.stderr.write("Reading model from {} ...\n".format(model_file_name))
+    model.populate(model_file_name)
 
     return model, model_variables
 
@@ -504,8 +372,6 @@ def run_model(options, model_variables):
 
 
 optpr = OptionParser()
-optpr.add_option("--mode", dest="mode", type="choice",
-                choices=["train", "test", "refresh", "predict"], default="train")
 optpr.add_option("-n", "--model_name", help="Name of model directory to save model to.")
 optpr.add_option("--raw_input", type="str", metavar="FILE")
 optpr.add_option("--config", type="str", metavar="FILE")
