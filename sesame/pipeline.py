@@ -215,12 +215,14 @@ def print_as_conll_targetid(gold_examples, predicted_target_dict, out_conll_file
     Creates a CoNLL object with predicted target and lexical unit.
     Spits out one CoNLL for each LU.
     """
+    
     with codecs.open(out_conll_file, "w", "utf-8") as conll_file:
         for gold, pred in zip(gold_examples, predicted_target_dict):
             for target in sorted(pred):
                 result = gold.get_predicted_target_conll(target, pred[target][0]) + "\n"
                 conll_file.write(result)
         conll_file.close()
+    
 
 def print_as_conll_frameid(goldexamples, pred_targmaps, out_conll_file):
     with codecs.open(out_conll_file, "w", "utf-8") as f:
@@ -238,10 +240,10 @@ def print_as_conll_frameid(goldexamples, pred_targmaps, out_conll_file):
 
 
 
-def build_targetid_model(options, common):
+def build_targetid_model(model_name, common):
     
 
-    model_dir = "logs/{}/".format(options['model_name'])
+    model_dir = "logs/{}/".format(model_name)
     model_file_name = "{}best-targetid-{}-model".format(model_dir, VERSION)
     if not os.path.exists(model_dir):
         os.makedirs(model_dir)
@@ -377,15 +379,23 @@ def build_targetid_model(options, common):
 
     return model, model_variables
 
-def run_model_targetid(options, model_variables):
+def run_model_targetid(raw_input_path, model_variables):
 
     builders = model_variables['builders']
     model_dir = model_variables['model_dir']
 
-    assert options['raw_input'] is not None
-    with open(options['raw_input'], "r") as fin:
-        instances = [make_data_instance(line, i) for i,line in enumerate(fin)]
+    with open(raw_input_path, "r") as fin:
+        instances = []
+        offsets = [] # contains array with for each row, the offsets of each token
+        for i,line in enumerate(fin):
+            instance, offset = make_data_instance(line, i, get_offsets=True)
+            instances.append(instance)
+            offsets.append(offset)
+        # filter empty rows
         instances = [el for el in instances if el]
+
+    with open('{}offsets.json'.format(model_dir), 'w') as f:
+        json.dump(offsets, f)
     out_conll_file = "{}predicted-targets.conll".format(model_dir)
 
     predictions = []
@@ -395,6 +405,8 @@ def run_model_targetid(options, model_variables):
     sys.stderr.write("Printing output in CoNLL format to {}\n".format(out_conll_file))
     print_as_conll_targetid(instances, predictions, out_conll_file)
     sys.stderr.write("Done!\n")
+
+    return offsets
 
 
 def find_multitokentargets(examples, split):
@@ -654,40 +666,58 @@ def run_model_frameid(options, model_variables):
     out_conll_file = "{}predicted-frames.conll".format(model_dir)
 
     predictions = []
+    sents_num = []
     for instance in instances:
         _, prediction = identify_frames(builders, instance.tokens, instance.postags, instance.lu, instance.targetframedict.keys(), model_variables)
+        sents_num.append(instance.sent_num)
         predictions.append(prediction)
     sys.stderr.write("Printing output in CoNLL format to {}\n".format(out_conll_file))
     print_as_conll_frameid(instances, predictions, out_conll_file)
     sys.stderr.write("Done!\n")
-    return predictions
+    return predictions, sents_num
 
-
-optpr = OptionParser()
-optpr.add_option("-n", "--model_name", help="Name of model directory to save model to.")
-optpr.add_option("--raw_input", type="str", metavar="FILE")
-(options, args) = optpr.parse_args()
 
 if __name__ == '__main__':
 
+    optpr = OptionParser()
+    optpr.add_option("-n", "--model_name", help="Name of model directory to save model to.")
+    optpr.add_option("--raw_input", type="str", metavar="FILE")
+    (options, args) = optpr.parse_args()
+
     common = common_load()
 
-    options_targetid = {
-        'model_name': 'fn1.7-pretrained-targetid',
-        'raw_input': options.raw_input
-    }
-    model_targetid, model_targetid_variables = build_targetid_model(options_targetid, common)
-    run_model_targetid(options_targetid, model_targetid_variables)
-
+    model_name_targetid = 'fn1.7-pretrained-targetid'
+    raw_input = options.raw_input
     options_frameid = {
         'model_name': 'fn1.7-pretrained-frameid',
         'raw_input': 'logs/fn1.7-pretrained-targetid/predicted-targets.conll',
         'hier': False,
         'exemplar': False
     }
+
+    model_targetid, model_targetid_variables = build_targetid_model(model_name_targetid, common)
     model_frameid, model_frameid_variables = build_frameid_model(options_frameid, common)
-    predictions = run_model_frameid(options_frameid, model_frameid_variables)
+    
+    offsets = run_model_targetid(raw_input, model_targetid_variables)
+    predictions, sents_num = run_model_frameid(options_frameid, model_frameid_variables)
 
     # [{index: (LexicalUnit, Frame)} for each instance]
     # LexicalUnit.get_str(LUDICT, LUPOSDICT), Frame.get_str(FRAMEDICT)
-    print(predictions)
+    #print(predictions)
+    result = []
+    for prediction, sent_num in zip(predictions, sents_num):
+        for token_id, (lu, frame) in prediction.items():
+            offset_line = offsets[sent_num]
+            lu = {
+                'lu': lu.get_str(LUDICT, LUPOSDICT),
+                'frame': frame.get_str(FRAMEDICT),
+                'offset': {
+                    'line': sent_num,
+                    'start': offset_line[token_id][0],
+                    'end': offset_line[token_id][1]
+                }
+            }
+            result.append(lu)
+
+    with open('predictions.json', 'w') as f:
+        json.dump(result, f)
