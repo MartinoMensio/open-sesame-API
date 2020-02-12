@@ -10,6 +10,36 @@ from evaluation import *
 from raw_data import make_data_instance
 from semafor_evaluation import convert_conll_to_frame_elements
 
+
+def common_load():
+    train_conll = TRAIN_FTE
+    train_examples, _, _ = read_conll(train_conll)
+    # combined_train = combine_examples(train_examples) #useless
+    find_multitokentargets(train_examples, "train")
+
+    # Need to read all LUs before locking the dictionaries.
+    target_lu_map, lu_names = create_target_lu_map()
+    post_train_lock_dicts()
+
+    lufrmmap, relatedlus = read_related_lus()
+
+    # Read pretrained word embeddings.
+    pretrained_map = get_wvec_map()
+    PRETRAINED_DIM = len(pretrained_map.values()[0])
+
+    lock_dicts()
+    UNKTOKEN = VOCDICT.getid(UNK)
+
+    return {
+        'pretrained_map': pretrained_map,
+        'PRETRAINED_DIM': PRETRAINED_DIM,
+        'target_lu_map': target_lu_map,
+        'lu_names': lu_names,
+        'lufrmmap': lufrmmap,
+        'relatedlus': relatedlus
+    }
+
+
 def combine_examples(corpus_ex):
     """
     Target ID needs to be trained for all targets in the sentence jointly, as opposed to
@@ -180,7 +210,7 @@ def identify_targets(builders, tokens, postags, lemmas, model_variables, gold_ta
     return objective, predicted_targets
 
 
-def print_as_conll(gold_examples, predicted_target_dict, out_conll_file):
+def print_as_conll_targetid(gold_examples, predicted_target_dict, out_conll_file):
     """
     Creates a CoNLL object with predicted target and lexical unit.
     Spits out one CoNLL for each LU.
@@ -192,6 +222,12 @@ def print_as_conll(gold_examples, predicted_target_dict, out_conll_file):
                 conll_file.write(result)
         conll_file.close()
 
+def print_as_conll_frameid(goldexamples, pred_targmaps, out_conll_file):
+    with codecs.open(out_conll_file, "w", "utf-8") as f:
+        for g,p in zip(goldexamples, pred_targmaps):
+            result = g.get_predicted_frame_conll(p) + "\n"
+            f.write(result)
+        f.close()
 
 
 
@@ -201,7 +237,8 @@ def print_as_conll(gold_examples, predicted_target_dict, out_conll_file):
 
 
 
-def build_targetid_model(options):
+
+def build_targetid_model(options, common):
     
 
     model_dir = "logs/{}/".format(options['model_name'])
@@ -218,21 +255,10 @@ def build_targetid_model(options):
     sys.stderr.write("MODEL FOR TEST / PREDICTION:\t{}\n".format(model_file_name))
     sys.stderr.write("_____________________\n\n")
 
-
-
-    train_examples, _, _ = read_conll(train_conll)
-    combined_train = combine_examples(train_examples)
-
-    # Need to read all LUs before locking the dictionaries.
-    target_lu_map, lu_names = create_target_lu_map()
-    post_train_lock_dicts()
-
-    # Read pretrained word embeddings.
-    pretrained_map = get_wvec_map()
-    PRETRAINED_DIM = len(pretrained_map.values()[0])
-
-    lock_dicts()
-    UNKTOKEN = VOCDICT.getid(UNK)
+    PRETRAINED_DIM = common['PRETRAINED_DIM']
+    pretrained_map = common['pretrained_map']
+    target_lu_map = common['target_lu_map']
+    lu_names = common['lu_names']
 
 
     # Default configurations.
@@ -367,8 +393,274 @@ def run_model_targetid(options, model_variables):
         _, prediction = identify_targets(builders, instance.tokens, instance.postags, instance.lemmas, model_variables)
         predictions.append(prediction)
     sys.stderr.write("Printing output in CoNLL format to {}\n".format(out_conll_file))
-    print_as_conll(instances, predictions, out_conll_file)
+    print_as_conll_targetid(instances, predictions, out_conll_file)
     sys.stderr.write("Done!\n")
+
+
+def find_multitokentargets(examples, split):
+    multitoktargs = tottargs = 0.0
+    for tr in examples:
+        tottargs += 1
+        if len(tr.targetframedict) > 1:
+            multitoktargs += 1
+            tfs = set(tr.targetframedict.values())
+            if len(tfs) > 1:
+                raise Exception("different frames for neighboring targets!", tr.targetframedict)
+    sys.stderr.write("multi-token targets in %s: %.3f%% [%d / %d]\n"
+                     %(split, multitoktargs*100/tottargs, multitoktargs, tottargs))
+
+
+def identify_frames(builders, tokens, postags, lexunit, targetpositions, model_variables, goldframe=None):
+    
+    v_x = model_variables['v_x']
+    p_x = model_variables['p_x']
+    pretrained_embeddings_map = model_variables['pretrained_embeddings_map']
+    e_x = model_variables['e_x']
+    u_x = model_variables['u_x']
+    w_e = model_variables['w_e']
+    b_e = model_variables['b_e']
+    USE_DROPOUT = model_variables['USE_DROPOUT']
+    DROPOUT_RATE = model_variables['DROPOUT_RATE']
+    tlstm = model_variables['tlstm']
+    lufrmmap = model_variables['lufrmmap']
+    USE_HIER = model_variables['USE_HIER']
+    relatedlus = model_variables['relatedlus']
+    lu_x = model_variables['lu_x']
+    lp_x = model_variables['lp_x']
+    w_f = model_variables['w_f']
+    w_z = model_variables['w_z']
+    b_z = model_variables['b_z']
+    b_f = model_variables['b_f']
+    
+    renew_cg()
+    trainmode = (goldframe is not None)
+
+    sentlen = len(tokens) - 1
+    emb_x = [v_x[tok] for tok in tokens]
+    pos_x = [p_x[pos] for pos in postags]
+
+    emb2_xi = []
+    for i in xrange(sentlen + 1):
+        if tokens[i] in pretrained_embeddings_map:
+            # If update set to False, prevents pretrained embeddings from being updated.
+            emb_without_backprop = lookup(e_x, tokens[i], update=True)
+            features_at_i = concatenate([emb_x[i], pos_x[i], emb_without_backprop])
+        else:
+            features_at_i = concatenate([emb_x[i], pos_x[i], u_x])
+        emb2_xi.append(w_e * features_at_i + b_e)
+
+    emb2_x = [rectify(emb2_xi[i]) for i in xrange(sentlen+1)]
+
+    # initializing the two LSTMs
+    if USE_DROPOUT and trainmode:
+        builders[0].set_dropout(DROPOUT_RATE)
+        builders[1].set_dropout(DROPOUT_RATE)
+    f_init, b_init = [i.initial_state() for i in builders]
+
+    fw_x = f_init.transduce(emb2_x)
+    bw_x = b_init.transduce(reversed(emb2_x))
+
+    # only using the first target position - summing them hurts :(
+    targetembs = [concatenate([fw_x[targetidx], bw_x[sentlen - targetidx - 1]]) for targetidx in targetpositions]
+    targinit = tlstm.initial_state()
+    target_vec = targinit.transduce(targetembs)[-1]
+
+    valid_frames = list(lufrmmap[lexunit.id])
+    chosenframe = valid_frames[0]
+    logloss = None
+    if len(valid_frames) > 1:
+        if USE_HIER and lexunit.id in relatedlus:
+            lu_vec = esum([lu_x[luid] for luid in relatedlus[lexunit.id]])
+        else:
+            lu_vec = lu_x[lexunit.id]
+        fbemb_i = concatenate([target_vec, lu_vec, lp_x[lexunit.posid]])
+        # TODO(swabha): Add more Baidu-style features here.
+        f_i = w_f * rectify(w_z * fbemb_i + b_z) + b_f
+        if trainmode and USE_DROPOUT:
+            f_i = dropout(f_i, DROPOUT_RATE)
+
+        logloss = log_softmax(f_i, valid_frames)
+
+        if not trainmode:
+            chosenframe = np.argmax(logloss.npvalue())
+
+    if trainmode:
+        chosenframe = goldframe.id
+
+    losses = []
+    if logloss is not None:
+        losses.append(pick(logloss, chosenframe))
+
+    prediction = {tidx: (lexunit, Frame(chosenframe)) for tidx in targetpositions}
+
+    objective = -esum(losses) if losses else None
+    return objective, prediction
+
+
+def build_frameid_model(options, common):
+    model_dir = "logs/{}/".format(options['model_name'])
+    model_file_name = "{}best-frameid-{}-model".format(model_dir, VERSION)
+    if not os.path.exists(model_dir):
+        os.makedirs(model_dir)
+
+    train_conll = TRAIN_FTE
+    USE_DROPOUT = False
+    USE_WV = True
+    USE_HIER = options.get('hier', False)
+
+    sys.stderr.write("_____________________\n")
+    sys.stderr.write("COMMAND: {}\n".format(" ".join(sys.argv)))
+    sys.stderr.write("MODEL FOR TEST / PREDICTION:\t{}\n".format(model_file_name))
+    sys.stderr.write("_____________________\n\n")
+
+    lufrmmap = common['lufrmmap']
+    relatedlus = common['relatedlus']
+    if USE_WV:
+        pretrained_embeddings_map = common['pretrained_map']
+        PRETRAINED_DIM = len(pretrained_embeddings_map.values()[0])
+
+    # Default configurations.
+    configuration = {'train': train_conll,
+                    'use_exemplar': options['exemplar'],
+                    'use_hierarchy': USE_HIER,
+                    'unk_prob': 0.1,
+                    'dropout_rate': 0.01,
+                    'token_dim': 100,
+                    'pos_dim': 100,
+                    'lu_dim': 100,
+                    'lu_pos_dim': 100,
+                    'lstm_input_dim': 100,
+                    'lstm_dim': 100,
+                    'lstm_depth': 2,
+                    'hidden_dim': 100,
+                    'use_dropout': USE_DROPOUT,
+                    'pretrained_embedding_dim': PRETRAINED_DIM,
+                    'num_epochs': 100 if not options['exemplar'] else 25,
+                    'patience': 25,
+                    'eval_after_every_epochs': 100,
+                    'dev_eval_epoch_frequency': 5}
+    configuration_file = os.path.join(model_dir, 'configuration.json')
+
+    json_file = open(configuration_file, "r")
+    configuration = json.load(json_file)
+
+
+    UNK_PROB = configuration['unk_prob']
+    DROPOUT_RATE = configuration['dropout_rate']
+
+    TOKDIM = configuration['token_dim']
+    POSDIM = configuration['pos_dim']
+    LUDIM = configuration['lu_dim']
+    LPDIM = configuration['lu_pos_dim']
+    INPDIM = TOKDIM + POSDIM
+
+    LSTMINPDIM = configuration['lstm_input_dim']
+    LSTMDIM = configuration['lstm_dim']
+    LSTMDEPTH = configuration['lstm_depth']
+    HIDDENDIM = configuration['hidden_dim']
+
+    NUM_EPOCHS = configuration['num_epochs']
+    PATIENCE = configuration['patience']
+    EVAL_EVERY_EPOCH = configuration['eval_after_every_epochs']
+    DEV_EVAL_EPOCH = configuration['dev_eval_epoch_frequency'] * EVAL_EVERY_EPOCH
+
+    sys.stderr.write("\nPARSER SETTINGS (see {})\n_____________________\n".format(configuration_file))
+    for key in sorted(configuration):
+        sys.stderr.write("{}:\t{}\n".format(key.upper(), configuration[key]))
+
+    sys.stderr.write("\n")
+
+    print_data_status(VOCDICT, "Tokens")
+    print_data_status(POSDICT, "POS tags")
+    print_data_status(LUDICT, "LUs")
+    print_data_status(LUPOSDICT, "LU POS tags")
+    print_data_status(FRAMEDICT, "Frames")
+    sys.stderr.write("\n_____________________\n\n")
+
+    model = Model()
+    trainer = SimpleSGDTrainer(model)
+    # trainer = AdamTrainer(model, 0.0001, 0.01, 0.9999, 1e-8)
+
+    v_x = model.add_lookup_parameters((VOCDICT.size(), TOKDIM))
+    p_x = model.add_lookup_parameters((POSDICT.size(), POSDIM))
+    lu_x = model.add_lookup_parameters((LUDICT.size(), LUDIM))
+    lp_x = model.add_lookup_parameters((LUPOSDICT.size(), LPDIM))
+    if USE_WV:
+        e_x = model.add_lookup_parameters((VOCDICT.size(), PRETRAINED_DIM))
+        for wordid in pretrained_embeddings_map:
+            e_x.init_row(wordid, pretrained_embeddings_map[wordid])
+
+        # Embedding for unknown pretrained embedding.
+        u_x = model.add_lookup_parameters((1, PRETRAINED_DIM), init='glorot')
+
+        w_e = model.add_parameters((LSTMINPDIM, PRETRAINED_DIM+INPDIM))
+        b_e = model.add_parameters((LSTMINPDIM, 1))
+
+    w_i = model.add_parameters((LSTMINPDIM, INPDIM))
+    b_i = model.add_parameters((LSTMINPDIM, 1))
+
+    builders = [
+        LSTMBuilder(LSTMDEPTH, LSTMINPDIM, LSTMDIM, model),
+        LSTMBuilder(LSTMDEPTH, LSTMINPDIM, LSTMDIM, model),
+    ]
+
+    tlstm = LSTMBuilder(LSTMDEPTH, 2*LSTMDIM, LSTMDIM, model)
+
+    w_z = model.add_parameters((HIDDENDIM, LSTMDIM + LUDIM + LPDIM))
+    b_z = model.add_parameters((HIDDENDIM, 1))
+    w_f = model.add_parameters((FRAMEDICT.size(), HIDDENDIM))
+    b_f = model.add_parameters((FRAMEDICT.size(), 1))
+
+
+    model_variables = {
+        'v_x': v_x,
+        'p_x': p_x,
+        'pretrained_embeddings_map': pretrained_embeddings_map,
+        'e_x': e_x,
+        'u_x': u_x,
+        'w_e': w_e,
+        'b_e': b_e,
+        'USE_DROPOUT': USE_DROPOUT,
+        'DROPOUT_RATE': DROPOUT_RATE,
+        'tlstm': tlstm,
+        'lufrmmap': lufrmmap,
+        'USE_HIER': USE_HIER,
+        'relatedlus': relatedlus,
+        'lu_x': lu_x,
+        'lp_x': lp_x,
+        'w_f': w_f,
+        'w_z': w_z,
+        'b_z': b_z,
+        'b_f': b_f,
+        'builders': builders,
+        'model_dir': model_dir
+    }
+
+
+    sys.stderr.write("Loading model from {} ...\n".format(model_file_name))
+    model.populate(model_file_name)
+
+    return model, model_variables
+
+
+def run_model_frameid(options, model_variables):
+
+    assert options['raw_input'] is not None
+    instances, _, _ = read_conll(options['raw_input'])
+
+    builders = model_variables['builders']
+    model_dir = model_variables['model_dir']
+
+    out_conll_file = "{}predicted-frames.conll".format(model_dir)
+
+    predictions = []
+    for instance in instances:
+        _, prediction = identify_frames(builders, instance.tokens, instance.postags, instance.lu, instance.targetframedict.keys(), model_variables)
+        predictions.append(prediction)
+    sys.stderr.write("Printing output in CoNLL format to {}\n".format(out_conll_file))
+    print_as_conll_frameid(instances, predictions, out_conll_file)
+    sys.stderr.write("Done!\n")
+    return predictions
 
 
 optpr = OptionParser()
@@ -377,14 +669,25 @@ optpr.add_option("--raw_input", type="str", metavar="FILE")
 (options, args) = optpr.parse_args()
 
 if __name__ == '__main__':
+
+    common = common_load()
+
     options_targetid = {
         'model_name': 'fn1.7-pretrained-targetid',
         'raw_input': options.raw_input
     }
-    model_targetid, model_targetid_variables = build_targetid_model(options_targetid)
+    model_targetid, model_targetid_variables = build_targetid_model(options_targetid, common)
     run_model_targetid(options_targetid, model_targetid_variables)
 
     options_frameid = {
         'model_name': 'fn1.7-pretrained-frameid',
-        'raw_input': 'logs/fn1.7-pretrained-targetid/predicted-targets.conll'
+        'raw_input': 'logs/fn1.7-pretrained-targetid/predicted-targets.conll',
+        'hier': False,
+        'exemplar': False
     }
+    model_frameid, model_frameid_variables = build_frameid_model(options_frameid, common)
+    predictions = run_model_frameid(options_frameid, model_frameid_variables)
+
+    # [{index: (LexicalUnit, Frame)} for each instance]
+    # LexicalUnit.get_str(LUDICT, LUPOSDICT), Frame.get_str(FRAMEDICT)
+    print(predictions)
