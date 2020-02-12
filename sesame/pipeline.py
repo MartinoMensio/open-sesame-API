@@ -201,10 +201,10 @@ def print_as_conll(gold_examples, predicted_target_dict, out_conll_file):
 
 
 
-def build_model(options):
+def build_targetid_model(options):
     
 
-    model_dir = "logs/{}/".format(options.model_name)
+    model_dir = "logs/{}/".format(options['model_name'])
     model_file_name = "{}best-targetid-{}-model".format(model_dir, VERSION)
     if not os.path.exists(model_dir):
         os.makedirs(model_dir)
@@ -351,13 +351,13 @@ def build_model(options):
 
     return model, model_variables
 
-def run_model(options, model_variables):
+def run_model_targetid(options, model_variables):
 
     builders = model_variables['builders']
     model_dir = model_variables['model_dir']
 
-    assert options.raw_input is not None
-    with open(options.raw_input, "r") as fin:
+    assert options['raw_input'] is not None
+    with open(options['raw_input'], "r") as fin:
         instances = [make_data_instance(line, i) for i,line in enumerate(fin)]
         instances = [el for el in instances if el]
     out_conll_file = "{}predicted-targets.conll".format(model_dir)
@@ -374,9 +374,17 @@ def run_model(options, model_variables):
 optpr = OptionParser()
 optpr.add_option("-n", "--model_name", help="Name of model directory to save model to.")
 optpr.add_option("--raw_input", type="str", metavar="FILE")
-optpr.add_option("--config", type="str", metavar="FILE")
 (options, args) = optpr.parse_args()
 
 if __name__ == '__main__':
-    model, model_variables = build_model(options)
-    run_model(options, model_variables)
+    options_targetid = {
+        'model_name': 'fn1.7-pretrained-targetid',
+        'raw_input': options.raw_input
+    }
+    model_targetid, model_targetid_variables = build_targetid_model(options_targetid)
+    run_model_targetid(options_targetid, model_targetid_variables)
+
+    options_frameid = {
+        'model_name': 'fn1.7-pretrained-frameid',
+        'raw_input': 'logs/fn1.7-pretrained-targetid/predicted-targets.conll'
+    }
